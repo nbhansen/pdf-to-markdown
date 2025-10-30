@@ -1,0 +1,22 @@
+# Generated output files
+outputs/
+logs/
+
+# Test PDFs
+*.pdf
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

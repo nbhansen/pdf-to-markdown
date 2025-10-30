@@ -56,9 +56,11 @@ class MarkdownPDFExtractor(PDFExtractor):
 
     BULLET_POINTS = "•◦▪▫●○"
 
-    def __init__(self, pdf_path):
+    def __init__(self, pdf_path, pages_per_file=None, split_pages=False):
         super().__init__(pdf_path)
         self.pdf_filename = Path(pdf_path).stem
+        self.pages_per_file = pages_per_file
+        self.split_pages = split_pages
         Path(config["OUTPUT_DIR"]).mkdir(parents=True, exist_ok=True)
         self.setup_image_captioning()
 
@@ -84,10 +86,7 @@ class MarkdownPDFExtractor(PDFExtractor):
     def extract(self):
         try:
             markdown_content, markdown_pages = self.extract_markdown()
-            self.save_markdown(markdown_content)
-            self.logger.info(
-                f"Markdown content has been saved to {Path(config['OUTPUT_DIR'])}/{self.pdf_filename}.md"
-            )
+            self.save_markdown(markdown_content, markdown_pages)
             return markdown_content, markdown_pages
 
         except Exception as e:
@@ -112,39 +111,46 @@ class MarkdownPDFExtractor(PDFExtractor):
             for page_num, page in enumerate(doc):
                 self.logger.info(f"Processing page {page_num + 1}")
                 page_content = ""
-                blocks = page.get_text("dict")["blocks"]
                 page_height = page.rect.height
                 links = self.extract_links(page)
 
-                if len(page.get_images()) > 0 and len(page.get_images()) <= 128:
-                    for block in blocks:
-                        if block["type"] == 0:  # Text
-                            page_content += self.process_text_block(
-                                block,
-                                page_height,
-                                links,
-                                list_counter,
-                                in_code_block,
-                                code_block_content,
-                                code_block_lang,
-                                prev_line,
-                            )
-                        elif block["type"] == 1:  # Image
-                            page_content += self.process_image_block(page, block)
-
+                # Check if page has extractable text, if not use OCR
+                if not self.has_extractable_text(page):
+                    self.logger.info(f"Page {page_num + 1} has no extractable text, performing OCR")
+                    page_content += self.ocr_page(page)
                 else:
-                    for block in blocks:
-                        if block["type"] == 0:  # Text
-                            page_content += self.process_text_block(
-                                block,
-                                page_height,
-                                links,
-                                list_counter,
-                                in_code_block,
-                                code_block_content,
-                                code_block_lang,
-                                prev_line,
-                            )
+                    # Normal text extraction
+                    blocks = page.get_text("dict")["blocks"]
+
+                    if len(page.get_images()) > 0 and len(page.get_images()) <= 128:
+                        for block in blocks:
+                            if block["type"] == 0:  # Text
+                                page_content += self.process_text_block(
+                                    block,
+                                    page_height,
+                                    links,
+                                    list_counter,
+                                    in_code_block,
+                                    code_block_content,
+                                    code_block_lang,
+                                    prev_line,
+                                )
+                            elif block["type"] == 1:  # Image
+                                page_content += self.process_image_block(page, block)
+
+                    else:
+                        for block in blocks:
+                            if block["type"] == 0:  # Text
+                                page_content += self.process_text_block(
+                                    block,
+                                    page_height,
+                                    links,
+                                    list_counter,
+                                    in_code_block,
+                                    code_block_content,
+                                    code_block_lang,
+                                    prev_line,
+                                )
 
                 # Insert tables at their approximate positions
                 while (
@@ -214,6 +220,46 @@ class MarkdownPDFExtractor(PDFExtractor):
             return markdown
         except Exception as e:
             self.logger.error(f"Error converting table to markdown: {e}")
+            self.logger.exception(traceback.format_exc())
+            return ""
+
+    def has_extractable_text(self, page):
+        """Check if a page has extractable text."""
+        try:
+            text = page.get_text().strip()
+            # Consider a page as having extractable text if it has more than 50 characters
+            return len(text) > 50
+        except Exception as e:
+            self.logger.error(f"Error checking for extractable text: {e}")
+            return False
+
+    def ocr_page(self, page):
+        """Perform OCR on an entire page and return markdown-formatted text."""
+        try:
+            # Get the page as an image
+            zoom_x = 2.0  # horizontal zoom for better OCR quality
+            zoom_y = 2.0  # vertical zoom
+            mat = fitz.Matrix(zoom_x, zoom_y)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
+            # Perform OCR using pytesseract
+            opencv_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+            ocr_text = pytesseract.image_to_string(opencv_image, lang='dan')
+
+            self.logger.info(f"OCR extracted {len(ocr_text)} characters from page")
+
+            # Basic formatting: preserve line breaks and clean up extra spaces
+            lines = ocr_text.split('\n')
+            formatted_text = ""
+            for line in lines:
+                line = line.strip()
+                if line:
+                    formatted_text += line + "\n\n"
+
+            return formatted_text
+        except Exception as e:
+            self.logger.error(f"Error performing page OCR: {e}")
             self.logger.exception(traceback.format_exc())
             return ""
 
@@ -309,7 +355,7 @@ class MarkdownPDFExtractor(PDFExtractor):
     def convert_bullet_to_markdown(self, text):
         """Convert a bullet point to markdown format."""
         text = re.sub(r"^\s*", "", text)
-        return re.sub(f"^[{re.escape(self.BULLET_POINTS)}]\s*", "- ", text)
+        return re.sub(rf"^[{re.escape(self.BULLET_POINTS)}]\s*", "- ", text)
 
     def is_numbered_list_item(self, text):
         """Check if the given text is a numbered list item."""
@@ -632,17 +678,38 @@ class MarkdownPDFExtractor(PDFExtractor):
             self.logger.exception(traceback.format_exc())
             return markdown_content
 
-    def save_markdown(self, markdown_content):
-        """Save the markdown content to a file."""
+    def save_markdown(self, markdown_content, markdown_pages):
+        """Save the markdown content to file(s)."""
         try:
             os.makedirs(Path(config["OUTPUT_DIR"]), exist_ok=True)
-            with open(
-                f"{Path(config['OUTPUT_DIR'])}/{self.pdf_filename}.md",
-                "w",
-                encoding="utf-8",
-            ) as f:
-                f.write(markdown_content)
-            self.logger.info("Markdown content saved successfully.")
+
+            # Split by individual pages
+            if self.split_pages:
+                for i, page_content in enumerate(markdown_pages, 1):
+                    output_file = Path(config["OUTPUT_DIR"]) / f"{self.pdf_filename}_page_{i}.md"
+                    with open(output_file, "w", encoding="utf-8") as f:
+                        f.write(page_content)
+                self.logger.info(f"Markdown content saved to {len(markdown_pages)} separate page files.")
+
+            # Split by pages per file
+            elif self.pages_per_file:
+                file_num = 1
+                for i in range(0, len(markdown_pages), self.pages_per_file):
+                    chunk = markdown_pages[i:i + self.pages_per_file]
+                    chunk_content = config["PAGE_DELIMITER"].join(chunk)
+                    output_file = Path(config["OUTPUT_DIR"]) / f"{self.pdf_filename}_part_{file_num}.md"
+                    with open(output_file, "w", encoding="utf-8") as f:
+                        f.write(chunk_content)
+                    file_num += 1
+                self.logger.info(f"Markdown content saved to {file_num - 1} files ({self.pages_per_file} pages each).")
+
+            # Save as single file (default)
+            else:
+                output_file = Path(config["OUTPUT_DIR"]) / f"{self.pdf_filename}.md"
+                with open(output_file, "w", encoding="utf-8") as f:
+                    f.write(markdown_content)
+                self.logger.info(f"Markdown content saved to {output_file}")
+
         except Exception as e:
             self.logger.error(f"Error saving markdown content: {e}")
             self.logger.exception(traceback.format_exc())
@@ -653,9 +720,24 @@ def main():
         description="Extract markdown-formatted content from a PDF file."
     )
     parser.add_argument("--pdf_path", help="Path to the input PDF file", required=True)
+    parser.add_argument(
+        "--pages-per-file",
+        type=int,
+        help="Split output into multiple files with specified number of pages per file",
+        default=None
+    )
+    parser.add_argument(
+        "--split-pages",
+        action="store_true",
+        help="Save each PDF page as a separate markdown file"
+    )
     args = parser.parse_args()
 
-    extractor = MarkdownPDFExtractor(args.pdf_path)
+    extractor = MarkdownPDFExtractor(
+        args.pdf_path,
+        pages_per_file=args.pages_per_file,
+        split_pages=args.split_pages
+    )
     markdown_pages = extractor.extract()
     return markdown_pages
 
